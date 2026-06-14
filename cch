@@ -1,0 +1,453 @@
+#!/bin/bash
+# cch - Claude/Codex conversation history search
+# Interactive fuzzy search through local assistant conversation history
+# Usage: cch [options] [initial_query ...]
+
+set -o pipefail
+
+CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude/projects}"
+CODEX_DIR="${CODEX_DIR:-$HOME/.codex/sessions}"
+CACHE_DIR="${CCH_CACHE_DIR:-$HOME/.cache/cch}"
+INDEX_FILE="$CACHE_DIR/index.lines"
+PREVIEW_DIR="$CACHE_DIR/previews"
+MAP_FILE="$CACHE_DIR/map.tsv"
+VERSION_FILE="$CACHE_DIR/version"
+CACHE_VERSION="2"
+SOURCE="${CCH_SOURCE:-all}"
+FORCE_REBUILD=0
+PRINT_CACHE=0
+
+usage() {
+    cat <<USAGE
+cch - search Claude Code and Codex conversation history
+
+Usage:
+  cch [options] [initial query...]
+
+Options:
+  -s, --source SOURCE   Source to search: all, claude, codex (default: all)
+  -r, --rebuild         Force rebuild cache before searching
+      --clean           Remove cch cache and rebuild
+      --cache           Print cache directory and exit
+  -h, --help            Show this help
+
+Keys:
+  Enter   output resume command
+  Ctrl-R  directly resume selected conversation
+  Ctrl-P  output preview file path
+  Ctrl-J  output raw JSONL file path
+
+Environment:
+  CLAUDE_DIR     Claude history dir (default: ~/.claude/projects)
+  CODEX_DIR      Codex history dir (default: ~/.codex/sessions)
+  CCH_CACHE_DIR  Cache dir (default: ~/.cache/cch)
+  CCH_SOURCE     Default source: all, claude, codex
+USAGE
+}
+
+query_parts=()
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -s|--source)
+            if [ -z "${2:-}" ]; then
+                echo "Error: --source requires all, claude, or codex" >&2
+                exit 2
+            fi
+            SOURCE="$2"
+            shift 2
+            ;;
+        --source=*)
+            SOURCE="${1#*=}"
+            shift
+            ;;
+        -r|--rebuild)
+            FORCE_REBUILD=1
+            shift
+            ;;
+        --clean)
+            rm -rf "$CACHE_DIR"
+            FORCE_REBUILD=1
+            shift
+            ;;
+        --cache)
+            PRINT_CACHE=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --)
+            shift
+            query_parts+=("$@")
+            break
+            ;;
+        *)
+            query_parts+=("$1")
+            shift
+            ;;
+    esac
+done
+
+case "$SOURCE" in
+    all|claude|codex) ;;
+    *)
+        echo "Error: invalid source '$SOURCE' (expected all, claude, or codex)" >&2
+        exit 2
+        ;;
+esac
+
+if [ ! -d "$CLAUDE_DIR" ] && [ ! -d "$CODEX_DIR" ]; then
+    echo "Error: neither $CLAUDE_DIR nor $CODEX_DIR exists" >&2
+    exit 1
+fi
+
+mkdir -p "$CACHE_DIR" "$PREVIEW_DIR"
+
+if [ "$PRINT_CACHE" -eq 1 ]; then
+    echo "$CACHE_DIR"
+    exit 0
+fi
+
+rebuild=$FORCE_REBUILD
+if [ ! -f "$INDEX_FILE" ] || [ ! -f "$MAP_FILE" ] || [ ! -f "$VERSION_FILE" ] || [ "$(cat "$VERSION_FILE" 2>/dev/null)" != "$CACHE_VERSION" ]; then
+    rebuild=1
+else
+    if [ -d "$CLAUDE_DIR" ]; then
+        latest_claude=$(find "$CLAUDE_DIR" -name "*.jsonl" -newer "$INDEX_FILE" -print -quit 2>/dev/null)
+        [ -n "$latest_claude" ] && rebuild=1
+    fi
+    if [ -d "$CODEX_DIR" ]; then
+        latest_codex=$(find "$CODEX_DIR" -name "*.jsonl" -newer "$INDEX_FILE" -print -quit 2>/dev/null)
+        [ -n "$latest_codex" ] && rebuild=1
+    fi
+fi
+
+if [ "$rebuild" -eq 1 ]; then
+    python3 - "$CLAUDE_DIR" "$CODEX_DIR" "$INDEX_FILE" "$PREVIEW_DIR" "$MAP_FILE" "$VERSION_FILE" "$CACHE_VERSION" <<'PYTHON'
+import json
+import os
+import re
+import sys
+import glob
+import shutil
+from pathlib import Path
+from datetime import datetime
+
+claude_dir, codex_dir, index_file, preview_dir, map_file, version_file, cache_version = sys.argv[1:]
+mtime_file = map_file + '.mtime'
+
+CONTROL_PREFIXES = (
+    '# AGENTS.md instructions',
+    '<environment_context>',
+    '<permissions instructions>',
+    '<collaboration_mode>',
+    '<skills_instructions>',
+)
+
+
+def one_line(text, limit=None):
+    if text is None:
+        return ''
+    if not isinstance(text, str):
+        text = str(text)
+    text = text.replace('\r', ' ').replace('\n', ' ').replace('\t', ' ')
+    text = re.sub(r'\s+', ' ', text).strip()
+    if limit is not None:
+        return text[:limit]
+    return text
+
+
+def safe_field(text):
+    return one_line(text).replace('\t', ' ')
+
+
+def should_skip_text(text):
+    stripped = text.lstrip()
+    return any(stripped.startswith(prefix) for prefix in CONTROL_PREFIXES)
+
+
+def content_to_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get('type')
+            if item_type in ('text', 'input_text', 'output_text'):
+                parts.append(item.get('text', ''))
+        return ' '.join(parts)
+    return ''
+
+
+def load_existing():
+    existing = {}
+    if os.path.exists(mtime_file):
+        with open(mtime_file, 'r', encoding='utf-8', errors='ignore') as handle:
+            for line in handle:
+                parts = line.rstrip('\n').split('\t')
+                if len(parts) == 4:
+                    existing[(parts[0], parts[1])] = (parts[2], float(parts[3]))
+                elif len(parts) == 3:
+                    existing[(parts[0], parts[1])] = (parts[1], float(parts[2]))
+                elif len(parts) == 2:
+                    existing[('claude', parts[0])] = (parts[0], float(parts[1]))
+    return existing
+
+
+def cache_name(source, session_id):
+    return f'{source}-{session_id}'
+
+
+def read_cached_session(source, session_id, mtime, path):
+    name = cache_name(source, session_id)
+    preview_path = os.path.join(preview_dir, name)
+    search_path = preview_path + '.search'
+    cwd_path = preview_path + '.cwd'
+    if not os.path.exists(preview_path):
+        return None
+    first_line = ''
+    with open(preview_path, 'r', encoding='utf-8', errors='ignore') as preview:
+        for line in preview:
+            if line.startswith('First:'):
+                first_line = one_line(line[6:], 120)
+                break
+    search_keywords = ''
+    if os.path.exists(search_path):
+        with open(search_path, 'r', encoding='utf-8', errors='ignore') as search:
+            search_keywords = one_line(search.read(), 2000)
+    cwd = ''
+    if os.path.exists(cwd_path):
+        with open(cwd_path, 'r', encoding='utf-8', errors='ignore') as cwd_file:
+            cwd = one_line(cwd_file.read())
+    date_str = datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M')
+    return (mtime, source, session_id, cwd, path, date_str, first_line, search_keywords)
+
+
+def write_cached_session(source, session_id, cwd, path, date_str, first_user_msg, messages, search_keywords):
+    name = cache_name(source, session_id)
+    preview_path = os.path.join(preview_dir, name)
+    with open(preview_path, 'w', encoding='utf-8') as preview:
+        preview.write(f'Source:  {source}\n')
+        preview.write(f'Session: {session_id}\n')
+        preview.write(f'CWD:     {cwd}\n')
+        preview.write(f'File:    {path}\n')
+        preview.write(f'Date:    {date_str}\n')
+        preview.write(f'First:   {first_user_msg}\n')
+        preview.write(f"\n{'─' * 50}\n\n")
+        for role, msg in messages[:30]:
+            preview.write(f'{role}: {one_line(msg, 300)}\n\n')
+    with open(preview_path + '.search', 'w', encoding='utf-8') as search:
+        search.write(search_keywords)
+    with open(preview_path + '.cwd', 'w', encoding='utf-8') as cwd_file:
+        cwd_file.write(cwd)
+
+
+def parse_claude(path):
+    session_id = Path(path).stem
+    cwd = ''
+    messages = []
+    first_user_msg = ''
+    with open(path, 'r', encoding='utf-8', errors='ignore') as handle:
+        for line in handle:
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not cwd and obj.get('cwd'):
+                cwd = one_line(obj.get('cwd'))
+            msg_type = obj.get('type')
+            if msg_type not in ('user', 'assistant'):
+                continue
+            content = content_to_text(obj.get('message', {}).get('content', ''))
+            if should_skip_text(content):
+                continue
+            text = one_line(content, 600)
+            if not text:
+                continue
+            messages.append((msg_type, text))
+            if msg_type == 'user' and not first_user_msg:
+                first_user_msg = one_line(content, 120)
+    return session_id, cwd, messages, first_user_msg
+
+
+def parse_codex(path):
+    session_id = Path(path).stem
+    cwd = ''
+    messages = []
+    first_user_msg = ''
+    with open(path, 'r', encoding='utf-8', errors='ignore') as handle:
+        for line in handle:
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            payload = obj.get('payload') or {}
+            record_type = obj.get('type')
+            if record_type == 'session_meta':
+                session_id = payload.get('id') or session_id
+                cwd = cwd or one_line(payload.get('cwd', ''))
+                continue
+            if record_type == 'turn_context':
+                cwd = cwd or one_line(payload.get('cwd', ''))
+                continue
+            if record_type != 'response_item':
+                continue
+            if payload.get('type') != 'message':
+                continue
+            role = payload.get('role')
+            if role not in ('user', 'assistant'):
+                continue
+            content = content_to_text(payload.get('content', []))
+            if should_skip_text(content):
+                continue
+            text = one_line(content, 600)
+            if not text:
+                continue
+            messages.append((role, text))
+            if role == 'user' and not first_user_msg:
+                first_user_msg = one_line(content, 120)
+    return session_id, cwd, messages, first_user_msg
+
+
+def iter_paths(source, root):
+    if not os.path.isdir(root):
+        return []
+    return glob.glob(os.path.join(root, '**', '*.jsonl'), recursive=True)
+
+existing = load_existing()
+sessions = []
+seen_keys = set()
+updated = 0
+reused = 0
+
+for source, root, parser in (
+    ('claude', claude_dir, parse_claude),
+    ('codex', codex_dir, parse_codex),
+):
+    for jsonl_path in iter_paths(source, root):
+        try:
+            mtime = os.path.getmtime(jsonl_path)
+            guessed_id = Path(jsonl_path).stem
+            cache_key = (source, jsonl_path)
+            cached = None
+            if cache_key in existing:
+                cached_id, cached_mtime = existing[cache_key]
+                if abs(cached_mtime - mtime) < 1:
+                    cached = read_cached_session(source, cached_id, mtime, jsonl_path)
+            legacy_key = (source, guessed_id)
+            if cached is None and legacy_key in existing:
+                cached_id, cached_mtime = existing[legacy_key]
+                if abs(cached_mtime - mtime) < 1:
+                    cached = read_cached_session(source, cached_id, mtime, jsonl_path)
+            if cached is not None:
+                sessions.append(cached)
+                seen_keys.add((source, cached[2]))
+                reused += 1
+                continue
+
+            session_id, cwd, messages, first_user_msg = parser(jsonl_path)
+            if not messages:
+                continue
+            if not first_user_msg:
+                first_user_msg = messages[0][1]
+            date_str = datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M')
+            search_keywords = one_line(' '.join(msg for _, msg in messages), 3000)
+            write_cached_session(source, session_id, cwd, jsonl_path, date_str, first_user_msg, messages, search_keywords)
+            sessions.append((mtime, source, session_id, cwd, jsonl_path, date_str, first_user_msg, search_keywords))
+            seen_keys.add((source, session_id))
+            updated += 1
+        except Exception:
+            continue
+
+# Clean previews from removed sessions and old cache versions.
+valid_names = {cache_name(source, session_id) for _, source, session_id, *_ in sessions}
+if os.path.isdir(preview_dir):
+    for entry in os.listdir(preview_dir):
+        base = entry
+        for suffix in ('.search', '.cwd'):
+            if base.endswith(suffix):
+                base = base[:-len(suffix)]
+        if base not in valid_names:
+            path = os.path.join(preview_dir, entry)
+            if os.path.isfile(path):
+                os.remove(path)
+            elif os.path.isdir(path):
+                shutil.rmtree(path)
+
+sessions.sort(key=lambda row: row[0], reverse=True)
+
+with open(index_file, 'w', encoding='utf-8') as index, \
+     open(map_file, 'w', encoding='utf-8') as mapping, \
+     open(mtime_file, 'w', encoding='utf-8') as mtimes:
+    for i, (mtime, source, session_id, cwd, path, date_str, first_user_msg, search_keywords) in enumerate(sessions):
+        line = f'[{source}] [{date_str}] {one_line(first_user_msg, 100)} | {search_keywords}'
+        index.write(line + '\n')
+        mapping.write('\t'.join([str(i), source, safe_field(session_id), safe_field(cwd), safe_field(path)]) + '\n')
+        mtimes.write('\t'.join([source, safe_field(path), safe_field(session_id), str(mtime)]) + '\n')
+
+with open(version_file, 'w', encoding='utf-8') as version:
+    version.write(cache_version)
+
+sys.stderr.write(f'Indexed {len(sessions)} sessions (updated: {updated}, reused: {reused})\n')
+PYTHON
+fi
+
+if [ ! -s "$INDEX_FILE" ]; then
+    echo "No conversations indexed" >&2
+    exit 1
+fi
+
+query="${query_parts[*]}"
+filter_cmd=(cat -n "$INDEX_FILE")
+if [ "$SOURCE" != "all" ]; then
+    filter_cmd=(awk -v src="[$SOURCE]" '{ if ($2 == src) print NR "\t" $0 }' "$INDEX_FILE")
+fi
+
+selected=$("${filter_cmd[@]}" | \
+    fzf --query="$query" \
+        --exact \
+        -i \
+        --preview="line_num=\$(echo {} | awk '{print \$1}'); sid=\$(awk -F'\t' -v n=\"\$((line_num - 1))\" 'NR==n+1 {print \$3}' '$MAP_FILE'); src=\$(awk -F'\t' -v n=\"\$((line_num - 1))\" 'NR==n+1 {print \$2}' '$MAP_FILE'); cat '$PREVIEW_DIR'/\$src-\$sid 2>/dev/null || echo 'No preview'" \
+        --preview-window=right:wrap:55% \
+        --header=$'Enter: 输出恢复命令\nCtrl-R: 直接恢复\nCtrl-P: 输出预览文件\nCtrl-J: 输出原始 JSONL\nCtrl-C: 退出' \
+        --tiebreak=index \
+        --no-sort \
+        --nth=2.. \
+        --expect=ctrl-r,ctrl-p,ctrl-j)
+
+if [ -n "$selected" ]; then
+    key=$(echo "$selected" | head -1)
+    line=$(echo "$selected" | tail -1)
+    line_num=$(echo "$line" | awk '{print $1}')
+    map_row=$(awk -F'\t' -v n="$((line_num - 1))" 'NR==n+1 {print}' "$MAP_FILE")
+    source=$(printf '%s\n' "$map_row" | awk -F'\t' '{print $2}')
+    session_id=$(printf '%s\n' "$map_row" | awk -F'\t' '{print $3}')
+    cwd=$(printf '%s\n' "$map_row" | awk -F'\t' '{print $4}')
+    jsonl_path=$(printf '%s\n' "$map_row" | awk -F'\t' '{print $5}')
+
+    if [ -z "$cwd" ] || [ ! -d "$cwd" ]; then
+        cwd="$HOME"
+    fi
+
+    preview_path="$PREVIEW_DIR/$source-$session_id"
+    if [ "$key" = "ctrl-p" ]; then
+        echo "$preview_path"
+    elif [ "$key" = "ctrl-j" ]; then
+        echo "$jsonl_path"
+    elif [ "$source" = "codex" ]; then
+        if [ "$key" = "ctrl-r" ]; then
+            cd "$cwd" && exec codex resume "$session_id"
+        else
+            printf 'cd %q && codex resume %q\n' "$cwd" "$session_id"
+        fi
+    else
+        if [ "$key" = "ctrl-r" ]; then
+            cd "$cwd" && exec claude --dangerously-skip-permissions --resume "$session_id"
+        else
+            printf 'cd %q && claude --dangerously-skip-permissions --resume %q\n' "$cwd" "$session_id"
+        fi
+    fi
+fi
