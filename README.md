@@ -29,21 +29,21 @@ Install from the latest GitHub release without cloning:
 
 ```bash
 mkdir -p "$HOME/.local/bin"
-curl -fsSL https://github.com/<owner>/<repo>/releases/latest/download/cch -o "$HOME/.local/bin/cch"
+curl -fsSL https://github.com/malikwang/cch/releases/latest/download/cch -o "$HOME/.local/bin/cch"
 chmod +x "$HOME/.local/bin/cch"
 ```
 
 Or use the installer script:
 
 ```bash
-curl -fsSL https://github.com/<owner>/<repo>/releases/latest/download/install.sh | CCH_REPO=<owner>/<repo> bash
+curl -fsSL https://github.com/malikwang/cch/releases/latest/download/install.sh | bash
 ```
 
 To install from source instead, clone the repository and link the executable into your PATH:
 
 
 ```bash
-git clone <your-cch-repo-url> "$HOME/src/cch"
+git clone git@github.com:malikwang/cch.git "$HOME/src/cch"
 mkdir -p "$HOME/bin" "$HOME/.local/bin"
 ln -sf "$HOME/src/cch/cch" "$HOME/bin/cch"
 ln -sf ~/bin/cch ~/.local/bin/cch

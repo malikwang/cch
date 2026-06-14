@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="${CCH_REPO:-<owner>/<repo>}"
+REPO="${CCH_REPO:-malikwang/cch}"
 VERSION="${CCH_VERSION:-latest}"
 INSTALL_DIR="${CCH_INSTALL_DIR:-$HOME/.local/bin}"
 BIN_NAME="${CCH_BIN_NAME:-cch}"
@@ -9,11 +9,6 @@ BIN_NAME="${CCH_BIN_NAME:-cch}"
 if ! command -v curl >/dev/null 2>&1; then
   echo "Error: curl is required" >&2
   exit 1
-fi
-
-if [ "$REPO" = "<owner>/<repo>" ]; then
-  echo "Error: set CCH_REPO to your GitHub repository, for example owner/repo" >&2
-  exit 2
 fi
 
 mkdir -p "$INSTALL_DIR"
