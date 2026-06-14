@@ -23,6 +23,14 @@ It builds a lightweight cache from local JSONL session files, lets you fuzzy-sea
 - `claude` CLI for Claude session resume
 - `codex` CLI for Codex session resume
 
+Install `fzf` first if it is missing:
+
+```bash
+brew install fzf          # macOS with Homebrew
+sudo port install fzf     # macOS with MacPorts
+sudo apt install fzf      # Ubuntu/Debian
+```
+
 ## Install
 
 Install from the latest GitHub release without cloning:

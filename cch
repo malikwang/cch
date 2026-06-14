@@ -45,6 +45,28 @@ Environment:
 USAGE
 }
 
+missing_dependency() {
+    dep="$1"
+    echo "Error: required dependency '$dep' is not installed or not in PATH." >&2
+    echo >&2
+    case "$dep" in
+        fzf)
+            echo "Install fzf with one of:" >&2
+            echo "  macOS Homebrew:  brew install fzf" >&2
+            echo "  macOS MacPorts:  sudo port install fzf" >&2
+            echo "  Ubuntu/Debian:   sudo apt install fzf" >&2
+            echo "  Fedora:          sudo dnf install fzf" >&2
+            echo "  Arch:            sudo pacman -S fzf" >&2
+            ;;
+        python3)
+            echo "Install Python 3 with your system package manager." >&2
+            echo "  macOS Homebrew:  brew install python" >&2
+            echo "  Ubuntu/Debian:   sudo apt install python3" >&2
+            ;;
+    esac
+    exit 127
+}
+
 query_parts=()
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -96,6 +118,10 @@ case "$SOURCE" in
         exit 2
         ;;
 esac
+
+for dep in python3 fzf; do
+    command -v "$dep" >/dev/null 2>&1 || missing_dependency "$dep"
+done
 
 if [ ! -d "$CLAUDE_DIR" ] && [ ! -d "$CODEX_DIR" ]; then
     echo "Error: neither $CLAUDE_DIR nor $CODEX_DIR exists" >&2

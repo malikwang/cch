@@ -23,6 +23,14 @@
 - `claude` CLI，用于恢复 Claude 会话
 - `codex` CLI，用于恢复 Codex 会话
 
+如果缺少 `fzf`，请先安装：
+
+```bash
+brew install fzf          # 使用 Homebrew 的 macOS
+sudo port install fzf     # 使用 MacPorts 的 macOS
+sudo apt install fzf      # Ubuntu/Debian
+```
+
 ## 安装
 
 无需 clone，直接从 GitHub 最新 Release 安装：
