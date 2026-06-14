@@ -26,8 +26,9 @@ It builds a lightweight cache from local JSONL session files, lets you fuzzy-sea
 Clone the repository and link the executable into your PATH:
 
 ```bash
-git clone git@github.com:malikwang/cch.git /media/wangyifan/SSD/project/cch
-ln -sf /media/wangyifan/SSD/project/cch/cch ~/bin/cch
+git clone <your-cch-repo-url> "$HOME/src/cch"
+mkdir -p "$HOME/bin" "$HOME/.local/bin"
+ln -sf "$HOME/src/cch/cch" "$HOME/bin/cch"
 ln -sf ~/bin/cch ~/.local/bin/cch
 ```
 
