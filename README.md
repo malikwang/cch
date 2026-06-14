@@ -25,7 +25,22 @@ It builds a lightweight cache from local JSONL session files, lets you fuzzy-sea
 
 ## Install
 
-Clone the repository and link the executable into your PATH:
+Install from the latest GitHub release without cloning:
+
+```bash
+mkdir -p "$HOME/.local/bin"
+curl -fsSL https://github.com/<owner>/<repo>/releases/latest/download/cch -o "$HOME/.local/bin/cch"
+chmod +x "$HOME/.local/bin/cch"
+```
+
+Or use the installer script:
+
+```bash
+curl -fsSL https://github.com/<owner>/<repo>/releases/latest/download/install.sh | CCH_REPO=<owner>/<repo> bash
+```
+
+To install from source instead, clone the repository and link the executable into your PATH:
+
 
 ```bash
 git clone <your-cch-repo-url> "$HOME/src/cch"

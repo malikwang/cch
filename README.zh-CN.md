@@ -25,7 +25,22 @@
 
 ## 安装
 
-克隆仓库，并把可执行脚本链接到 PATH 中：
+无需 clone，直接从 GitHub 最新 Release 安装：
+
+```bash
+mkdir -p "$HOME/.local/bin"
+curl -fsSL https://github.com/<owner>/<repo>/releases/latest/download/cch -o "$HOME/.local/bin/cch"
+chmod +x "$HOME/.local/bin/cch"
+```
+
+也可以使用安装脚本：
+
+```bash
+curl -fsSL https://github.com/<owner>/<repo>/releases/latest/download/install.sh | CCH_REPO=<owner>/<repo> bash
+```
+
+如果想从源码安装，可以克隆仓库，并把可执行脚本链接到 PATH 中：
+
 
 ```bash
 git clone <your-cch-repo-url> "$HOME/src/cch"
