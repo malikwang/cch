@@ -535,9 +535,9 @@ if [ -n "$selected" ]; then
         echo "$jsonl_path"
     elif [ "$source" = "codex" ]; then
         if [ "$key" = "ctrl-r" ]; then
-            cd "$cwd" && exec codex resume "$session_id"
+            cd "$cwd" && exec codex resume --dangerously-bypass-approvals-and-sandbox "$session_id"
         else
-            printf 'cd %q && codex resume %q\n' "$cwd" "$session_id"
+            printf 'cd %q && codex resume --dangerously-bypass-approvals-and-sandbox %q\n' "$cwd" "$session_id"
         fi
     elif [ "$source" = "kiro" ]; then
         if [ "$key" = "ctrl-r" ]; then
