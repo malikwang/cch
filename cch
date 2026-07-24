@@ -7,25 +7,27 @@ set -o pipefail
 
 CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude/projects}"
 CODEX_DIR="${CODEX_DIR:-$HOME/.codex/sessions}"
+KIRO_DIR="${KIRO_DIR:-$HOME/.kiro/sessions}"
+KIRO_BIN="${CCH_KIRO_BIN:-kiro-cli}"
 CACHE_DIR="${CCH_CACHE_DIR:-$HOME/.cache/cch}"
 INDEX_FILE="$CACHE_DIR/index.lines"
 PREVIEW_DIR="$CACHE_DIR/previews"
 MAP_FILE="$CACHE_DIR/map.tsv"
 VERSION_FILE="$CACHE_DIR/version"
-CACHE_VERSION="2"
+CACHE_VERSION="3"
 SOURCE="${CCH_SOURCE:-all}"
 FORCE_REBUILD=0
 PRINT_CACHE=0
 
 usage() {
     cat <<USAGE
-cch - search Claude Code and Codex conversation history
+cch - search Claude Code, Codex, and Kiro conversation history
 
 Usage:
   cch [options] [initial query...]
 
 Options:
-  -s, --source SOURCE   Source to search: all, claude, codex (default: all)
+  -s, --source SOURCE   Source to search: all, claude, codex, kiro (default: all)
   -r, --rebuild         Force rebuild cache before searching
       --clean           Remove cch cache and rebuild
       --cache           Print cache directory and exit
@@ -40,8 +42,10 @@ Keys:
 Environment:
   CLAUDE_DIR     Claude history dir (default: ~/.claude/projects)
   CODEX_DIR      Codex history dir (default: ~/.codex/sessions)
+  KIRO_DIR       Kiro history dir (default: ~/.kiro/sessions)
+  CCH_KIRO_BIN   Kiro CLI binary for resume (default: kiro-cli)
   CCH_CACHE_DIR  Cache dir (default: ~/.cache/cch)
-  CCH_SOURCE     Default source: all, claude, codex
+  CCH_SOURCE     Default source: all, claude, codex, kiro
 USAGE
 }
 
@@ -72,7 +76,7 @@ while [ "$#" -gt 0 ]; do
     case "$1" in
         -s|--source)
             if [ -z "${2:-}" ]; then
-                echo "Error: --source requires all, claude, or codex" >&2
+                echo "Error: --source requires all, claude, codex, or kiro" >&2
                 exit 2
             fi
             SOURCE="$2"
@@ -112,9 +116,9 @@ while [ "$#" -gt 0 ]; do
 done
 
 case "$SOURCE" in
-    all|claude|codex) ;;
+    all|claude|codex|kiro) ;;
     *)
-        echo "Error: invalid source '$SOURCE' (expected all, claude, or codex)" >&2
+        echo "Error: invalid source '$SOURCE' (expected all, claude, codex, or kiro)" >&2
         exit 2
         ;;
 esac
@@ -123,8 +127,8 @@ for dep in python3 fzf; do
     command -v "$dep" >/dev/null 2>&1 || missing_dependency "$dep"
 done
 
-if [ ! -d "$CLAUDE_DIR" ] && [ ! -d "$CODEX_DIR" ]; then
-    echo "Error: neither $CLAUDE_DIR nor $CODEX_DIR exists" >&2
+if [ ! -d "$CLAUDE_DIR" ] && [ ! -d "$CODEX_DIR" ] && [ ! -d "$KIRO_DIR" ]; then
+    echo "Error: none of $CLAUDE_DIR, $CODEX_DIR, or $KIRO_DIR exists" >&2
     exit 1
 fi
 
@@ -147,10 +151,14 @@ else
         latest_codex=$(find "$CODEX_DIR" -name "*.jsonl" -newer "$INDEX_FILE" -print -quit 2>/dev/null)
         [ -n "$latest_codex" ] && rebuild=1
     fi
+    if [ -d "$KIRO_DIR" ]; then
+        latest_kiro=$(find "$KIRO_DIR" -name "*.jsonl" -newer "$INDEX_FILE" -print -quit 2>/dev/null)
+        [ -n "$latest_kiro" ] && rebuild=1
+    fi
 fi
 
 if [ "$rebuild" -eq 1 ]; then
-    python3 - "$CLAUDE_DIR" "$CODEX_DIR" "$INDEX_FILE" "$PREVIEW_DIR" "$MAP_FILE" "$VERSION_FILE" "$CACHE_VERSION" <<'PYTHON'
+    python3 - "$CLAUDE_DIR" "$CODEX_DIR" "$KIRO_DIR" "$INDEX_FILE" "$PREVIEW_DIR" "$MAP_FILE" "$VERSION_FILE" "$CACHE_VERSION" <<'PYTHON'
 import json
 import os
 import re
@@ -160,7 +168,7 @@ import shutil
 from pathlib import Path
 from datetime import datetime
 
-claude_dir, codex_dir, index_file, preview_dir, map_file, version_file, cache_version = sys.argv[1:]
+claude_dir, codex_dir, kiro_dir, index_file, preview_dir, map_file, version_file, cache_version = sys.argv[1:]
 mtime_file = map_file + '.mtime'
 
 CONTROL_PREFIXES = (
@@ -204,6 +212,22 @@ def content_to_text(content):
             item_type = item.get('type')
             if item_type in ('text', 'input_text', 'output_text'):
                 parts.append(item.get('text', ''))
+        return ' '.join(parts)
+    return ''
+
+
+def kiro_content_to_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get('kind') == 'text':
+                data = item.get('data', '')
+                if isinstance(data, str):
+                    parts.append(data)
         return ' '.join(parts)
     return ''
 
@@ -338,6 +362,51 @@ def parse_codex(path):
     return session_id, cwd, messages, first_user_msg
 
 
+def parse_kiro(path):
+    session_id = Path(path).stem
+    cwd = ''
+    messages = []
+    first_user_msg = ''
+    title = ''
+    meta_path = os.path.splitext(path)[0] + '.json'
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, 'r', encoding='utf-8', errors='ignore') as meta_handle:
+                meta = json.load(meta_handle)
+            if isinstance(meta, dict):
+                session_id = meta.get('session_id') or session_id
+                cwd = one_line(meta.get('cwd', '')) or cwd
+                title = one_line(meta.get('title', ''))
+        except Exception:
+            pass
+    with open(path, 'r', encoding='utf-8', errors='ignore') as handle:
+        for line in handle:
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            kind = obj.get('kind')
+            if kind == 'Prompt':
+                role = 'user'
+            elif kind == 'AssistantMessage':
+                role = 'assistant'
+            else:
+                continue
+            data = obj.get('data') or {}
+            content = kiro_content_to_text(data.get('content', []))
+            if should_skip_text(content):
+                continue
+            text = one_line(content, 600)
+            if not text:
+                continue
+            messages.append((role, text))
+            if role == 'user' and not first_user_msg:
+                first_user_msg = one_line(content, 120)
+    if not first_user_msg and title:
+        first_user_msg = title
+    return session_id, cwd, messages, first_user_msg
+
+
 def iter_paths(source, root):
     if not os.path.isdir(root):
         return []
@@ -352,6 +421,7 @@ reused = 0
 for source, root, parser in (
     ('claude', claude_dir, parse_claude),
     ('codex', codex_dir, parse_codex),
+    ('kiro', kiro_dir, parse_kiro),
 ):
     for jsonl_path in iter_paths(source, root):
         try:
@@ -429,7 +499,7 @@ fi
 query="${query_parts[*]}"
 filter_cmd=(cat -n "$INDEX_FILE")
 if [ "$SOURCE" != "all" ]; then
-    filter_cmd=(awk -v src="[$SOURCE]" '{ if ($2 == src) print NR "\t" $0 }' "$INDEX_FILE")
+    filter_cmd=(awk -v src="[$SOURCE]" '{ if ($1 == src) print NR "\t" $0 }' "$INDEX_FILE")
 fi
 
 selected=$("${filter_cmd[@]}" | \
@@ -468,6 +538,12 @@ if [ -n "$selected" ]; then
             cd "$cwd" && exec codex resume "$session_id"
         else
             printf 'cd %q && codex resume %q\n' "$cwd" "$session_id"
+        fi
+    elif [ "$source" = "kiro" ]; then
+        if [ "$key" = "ctrl-r" ]; then
+            cd "$cwd" && exec "$KIRO_BIN" chat --resume-id "$session_id"
+        else
+            printf 'cd %q && %q chat --resume-id %q\n' "$cwd" "$KIRO_BIN" "$session_id"
         fi
     else
         if [ "$key" = "ctrl-r" ]; then

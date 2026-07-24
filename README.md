@@ -2,14 +2,15 @@
 
 [中文文档](README.zh-CN.md)
 
-`cch` is a local conversation history search tool for Claude Code and Codex CLI.
+`cch` is a local conversation history search tool for Claude Code, Codex CLI, and Kiro CLI.
 It builds a lightweight cache from local JSONL session files, lets you fuzzy-search with `fzf`, previews matching conversations, and outputs or directly runs the correct resume command.
 
 ## Features
 
 - Search Claude Code history from `~/.claude/projects`.
 - Search Codex history from `~/.codex/sessions`.
-- Filter by source with `--source claude`, `--source codex`, or `--source all`.
+- Search Kiro CLI history from `~/.kiro/sessions`.
+- Filter by source with `--source claude`, `--source codex`, `--source kiro`, or `--source all`.
 - Preview selected conversations in `fzf`.
 - Resume directly with `Ctrl-R`.
 - Print preview or raw JSONL paths with `Ctrl-P` and `Ctrl-J`.
@@ -22,6 +23,7 @@ It builds a lightweight cache from local JSONL session files, lets you fuzzy-sea
 - `fzf`
 - `claude` CLI for Claude session resume
 - `codex` CLI for Codex session resume
+- `kiro-cli` CLI for Kiro session resume
 
 Install `fzf` first if it is missing:
 
@@ -64,6 +66,7 @@ cch                         # search all conversations
 cch bug keyword             # search all conversations with an initial query
 cch -s codex keyword        # search Codex conversations only
 cch -s claude keyword       # search Claude conversations only
+cch -s kiro keyword         # search Kiro conversations only
 cch --rebuild               # force rebuild cache
 cch --clean                 # remove cache and rebuild
 cch --cache                 # print cache directory
@@ -80,8 +83,10 @@ cch --cache                 # print cache directory
 
 - `CLAUDE_DIR`: Claude history directory, default `~/.claude/projects`.
 - `CODEX_DIR`: Codex history directory, default `~/.codex/sessions`.
+- `KIRO_DIR`: Kiro history directory, default `~/.kiro/sessions`.
+- `CCH_KIRO_BIN`: Kiro CLI binary used for resume, default `kiro-cli`.
 - `CCH_CACHE_DIR`: cache directory, default `~/.cache/cch`.
-- `CCH_SOURCE`: default source filter, one of `all`, `claude`, or `codex`.
+- `CCH_SOURCE`: default source filter, one of `all`, `claude`, `codex`, or `kiro`.
 
 ## Cache
 
