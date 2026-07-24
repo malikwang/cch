@@ -541,9 +541,9 @@ if [ -n "$selected" ]; then
         fi
     elif [ "$source" = "kiro" ]; then
         if [ "$key" = "ctrl-r" ]; then
-            cd "$cwd" && exec "$KIRO_BIN" chat --resume-id "$session_id"
+            cd "$cwd" && exec "$KIRO_BIN" chat --trust-all-tools --resume-id "$session_id"
         else
-            printf 'cd %q && %q chat --resume-id %q\n' "$cwd" "$KIRO_BIN" "$session_id"
+            printf 'cd %q && %q chat --trust-all-tools --resume-id %q\n' "$cwd" "$KIRO_BIN" "$session_id"
         fi
     else
         if [ "$key" = "ctrl-r" ]; then
