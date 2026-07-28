@@ -18,6 +18,9 @@ CACHE_VERSION="3"
 SOURCE="${CCH_SOURCE:-all}"
 FORCE_REBUILD=0
 PRINT_CACHE=0
+KIRO_TAKEOVER="${CCH_KIRO_TAKEOVER:-1}"
+BLACKLIST_FILE="${CCH_BLACKLIST_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/cch/blacklist}"
+BLACKLIST_ENABLED=1
 
 usage() {
     cat <<USAGE
@@ -29,6 +32,8 @@ Usage:
 Options:
   -s, --source SOURCE   Source to search: all, claude, codex, kiro (default: all)
   -r, --rebuild         Force rebuild cache before searching
+      --no-takeover     Do not close the process holding a locked Kiro session
+      --no-blacklist    Do not filter sessions matching blacklist keywords
       --clean           Remove cch cache and rebuild
       --cache           Print cache directory and exit
   -h, --help            Show this help
@@ -46,6 +51,9 @@ Environment:
   CCH_KIRO_BIN   Kiro CLI binary for resume (default: kiro-cli)
   CCH_CACHE_DIR  Cache dir (default: ~/.cache/cch)
   CCH_SOURCE     Default source: all, claude, codex, kiro
+  CCH_KIRO_TAKEOVER  Set to 0 to refuse instead of closing a locked Kiro session
+  CCH_BLACKLIST      Newline-separated keywords; sessions whose first message contains any are hidden
+  CCH_BLACKLIST_FILE Blacklist file path (default: ~/.config/cch/blacklist)
 USAGE
 }
 
@@ -71,6 +79,136 @@ missing_dependency() {
     exit 127
 }
 
+# Emit blacklist keywords, one per line, trimmed and with blanks/comments
+# removed. Sources: the blacklist file (# starts a comment) and the newline
+# separated CCH_BLACKLIST env var. A session whose first message contains any
+# of these (case-insensitively) is hidden from the fzf list.
+blacklist_patterns() {
+    {
+        if [ -f "$BLACKLIST_FILE" ]; then
+            cat "$BLACKLIST_FILE"
+        fi
+        if [ -n "${CCH_BLACKLIST:-}" ]; then
+            printf '%s\n' "$CCH_BLACKLIST"
+        fi
+    } | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; /^#/d; /^$/d'
+}
+
+# Path of the lock file kiro-cli writes next to a session while it is open.
+kiro_lock_path() {
+    sid="$1"
+    jsonl="$2"
+    if [ -n "$jsonl" ]; then
+        printf '%s\n' "${jsonl%.jsonl}.lock"
+    else
+        printf '%s\n' "$KIRO_DIR/cli/$sid.lock"
+    fi
+}
+
+# Print the PID recorded in a Kiro session lock file, but only when that
+# process is still alive and still looks like a kiro-cli process. A stale lock
+# (owner gone, or PID recycled by something else) prints nothing.
+kiro_active_lock_pid() {
+    lock_file="$1"
+    [ -f "$lock_file" ] || return 0
+    lock_pid=$(sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$lock_file" | head -1)
+    [ -n "$lock_pid" ] || return 0
+    kill -0 "$lock_pid" 2>/dev/null || return 0
+    case "$(ps -o args= -p "$lock_pid" 2>/dev/null)" in
+        *kiro*) printf '%s\n' "$lock_pid" ;;
+    esac
+}
+
+# The lock records the `kiro-cli-chat acp` helper PID. Walk up to the
+# interactive `kiro-cli chat` process the user can actually see and quit.
+kiro_lock_owner_pid() {
+    owner_pid="$1"
+    while :; do
+        owner_ppid=$(ps -o ppid= -p "$owner_pid" 2>/dev/null | tr -d ' ')
+        case "$owner_ppid" in
+            ''|0|1) break ;;
+        esac
+        case "$(ps -o args= -p "$owner_ppid" 2>/dev/null)" in
+            *kiro-cli*) owner_pid="$owner_ppid" ;;
+            *) break ;;
+        esac
+    done
+    printf '%s\n' "$owner_pid"
+}
+
+# Free a session lock held by a live kiro-cli process so the session can be
+# resumed here. Asks the interactive process to quit first, escalates to
+# SIGKILL if it ignores that, then drops any lock file left behind. Conversation
+# history is flushed to the .jsonl store as it happens, so nothing is lost.
+kiro_takeover_lock() {
+    take_acp_pid="$1"
+    take_lock="$2"
+    take_pid=$(kiro_lock_owner_pid "$take_acp_pid")
+    take_tty=$(ps -o tty= -p "$take_pid" 2>/dev/null | tr -d ' ')
+    if [ -n "$take_tty" ] && [ "$take_tty" != "?" ]; then
+        echo "cch: session was open in PID $take_pid (tty $take_tty), closing it to take over" >&2
+    else
+        echo "cch: session was open in PID $take_pid, closing it to take over" >&2
+    fi
+    kill "$take_pid" 2>/dev/null
+    take_waited=0
+    while [ "$take_waited" -lt 50 ]; do
+        kill -0 "$take_pid" 2>/dev/null || break
+        sleep 0.1
+        take_waited=$((take_waited + 1))
+    done
+    if kill -0 "$take_pid" 2>/dev/null; then
+        echo "cch: PID $take_pid ignored SIGTERM, sending SIGKILL" >&2
+        kill -9 "$take_pid" 2>/dev/null
+        sleep 0.3
+    fi
+    # The lock is owned by the `kiro-cli-chat acp` helper; make sure it is gone.
+    if kill -0 "$take_acp_pid" 2>/dev/null; then
+        kill -9 "$take_acp_pid" 2>/dev/null
+        sleep 0.3
+    fi
+    if [ -n "$(kiro_active_lock_pid "$take_lock")" ]; then
+        echo "Error: Kiro session lock is still held after closing PID $take_pid." >&2
+        echo "Inspect it with: cat $take_lock" >&2
+        return 1
+    fi
+    rm -f "$take_lock"
+    return 0
+}
+
+# Used with --no-takeover: explain why we refuse, and how to get unstuck.
+# Without any check kiro-cli sits at "Initializing..." forever: the ACP layer
+# does reject the load with "Session is active in another process (PID N)", but
+# the TUI never shows the error, it only lands in /tmp/kiro-log/kiro-tui.log.
+kiro_report_locked() {
+    holder_pid=$(kiro_lock_owner_pid "$1")
+    locked_sid="$2"
+    locked_cwd="$3"
+    holder_tty=$(ps -o tty= -p "$holder_pid" 2>/dev/null | tr -d ' ')
+    holder_started=$(ps -o lstart= -p "$holder_pid" 2>/dev/null | sed 's/^[[:space:]]*//')
+    {
+        echo "Error: Kiro session $locked_sid is already open in another process."
+        printf 'Holder: PID %s' "$holder_pid"
+        if [ -n "$holder_tty" ] && [ "$holder_tty" != "?" ]; then
+            printf ' on tty %s' "$holder_tty"
+        fi
+        if [ -n "$holder_started" ]; then
+            printf ' (started %s)' "$holder_started"
+        fi
+        echo
+        echo
+        echo "Resuming it would hang at 'Initializing...' because the session lock is held."
+        echo "Options:"
+        if [ -n "$holder_tty" ] && [ "$holder_tty" != "?" ]; then
+            echo "  1. Go back to /dev/$holder_tty and keep using the session there."
+        fi
+        echo "  2. Quit that session, or run: kill $holder_pid   (history is already on disk)"
+        printf '  3. Read it without the TUI: cd %q && %q chat --trust-all-tools --resume-id %q --no-interactive "<prompt>"\n' \
+            "$locked_cwd" "$KIRO_BIN" "$locked_sid"
+        echo "  4. Let cch close it for you: drop --no-takeover (the default)."
+    } >&2
+}
+
 query_parts=()
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -88,6 +226,14 @@ while [ "$#" -gt 0 ]; do
             ;;
         -r|--rebuild)
             FORCE_REBUILD=1
+            shift
+            ;;
+        --no-takeover)
+            KIRO_TAKEOVER=0
+            shift
+            ;;
+        --no-blacklist)
+            BLACKLIST_ENABLED=0
             shift
             ;;
         --clean)
@@ -502,7 +648,40 @@ if [ "$SOURCE" != "all" ]; then
     filter_cmd=(awk -v src="[$SOURCE]" '{ if ($1 == src) print NR "\t" $0 }' "$INDEX_FILE")
 fi
 
-selected=$("${filter_cmd[@]}" | \
+# Drop sessions whose first message matches any blacklist keyword. Matching is
+# limited to the first-message segment (everything before " | " in the index
+# line) so a keyword that merely appears in the conversation body does not hide
+# an otherwise wanted session. Line numbers are already prepended (cat -n / NR)
+# so removing lines here keeps the map.tsv lookup valid.
+blacklist_filter=(cat)
+blacklist_tmp=""
+if [ "$BLACKLIST_ENABLED" -eq 1 ]; then
+    patterns=$(blacklist_patterns)
+    if [ -n "$patterns" ]; then
+        blacklist_tmp=$(mktemp "${TMPDIR:-/tmp}/cch-blacklist.XXXXXX")
+        trap 'rm -f "$blacklist_tmp"' EXIT
+        printf '%s\n' "$patterns" > "$blacklist_tmp"
+        blacklist_filter=(awk -v plist="$blacklist_tmp" '
+            BEGIN {
+                n = 0
+                while ((getline p < plist) > 0) {
+                    if (length(p) > 0) pats[++n] = tolower(p)
+                }
+            }
+            {
+                sep = index($0, " | ")
+                seg = (sep > 0) ? substr($0, 1, sep - 1) : $0
+                lseg = tolower(seg)
+                for (i = 1; i <= n; i++) {
+                    if (index(lseg, pats[i]) > 0) next
+                }
+                print
+            }
+        ')
+    fi
+fi
+
+selected=$("${filter_cmd[@]}" | "${blacklist_filter[@]}" | \
     fzf --query="$query" \
         --exact \
         -i \
@@ -540,6 +719,16 @@ if [ -n "$selected" ]; then
             printf 'cd %q && codex resume --dangerously-bypass-approvals-and-sandbox %q\n' "$cwd" "$session_id"
         fi
     elif [ "$source" = "kiro" ]; then
+        session_lock=$(kiro_lock_path "$session_id" "$jsonl_path")
+        held_pid=$(kiro_active_lock_pid "$session_lock")
+        if [ -n "$held_pid" ]; then
+            if [ "$KIRO_TAKEOVER" != "0" ]; then
+                kiro_takeover_lock "$held_pid" "$session_lock" || exit 1
+            else
+                kiro_report_locked "$held_pid" "$session_id" "$cwd"
+                exit 1
+            fi
+        fi
         if [ "$key" = "ctrl-r" ]; then
             cd "$cwd" && exec "$KIRO_BIN" chat --trust-all-tools --resume-id "$session_id"
         else

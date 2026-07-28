@@ -13,7 +13,9 @@ It builds a lightweight cache from local JSONL session files, lets you fuzzy-sea
 - Filter by source with `--source claude`, `--source codex`, `--source kiro`, or `--source all`.
 - Preview selected conversations in `fzf`.
 - Resume directly with `Ctrl-R`.
+- Detect Kiro sessions that are still open in another process and close the holder so the resume works instead of hanging.
 - Print preview or raw JSONL paths with `Ctrl-P` and `Ctrl-J`.
+- Hide noisy sessions (e.g. sub-agent prompts) whose first message matches blacklist keywords.
 - Rebuild or clean the cache when needed.
 
 ## Requirements
@@ -70,7 +72,57 @@ cch -s kiro keyword         # search Kiro conversations only
 cch --rebuild               # force rebuild cache
 cch --clean                 # remove cache and rebuild
 cch --cache                 # print cache directory
+cch --no-takeover           # refuse instead of closing a locked Kiro session
+cch --no-blacklist          # show all sessions, ignoring blacklist keywords
 ```
+
+## Locked Kiro sessions
+
+`kiro-cli` takes a per-session lock while a session is open. Resuming the same
+session id from a second terminal makes the TUI sit at `Initializing...`
+forever: the underlying ACP layer does reject the load with
+`Session is active in another process (PID N)`, but the TUI never renders that
+error — it only lands in `/tmp/kiro-log/kiro-tui.log`.
+
+Before resuming, `cch` reads the session's `.lock` file and checks whether the
+recorded PID is still alive. By default it takes the session over: it asks the
+holding `kiro-cli chat` process to quit (escalating to `SIGKILL` if it ignores
+`SIGTERM`), removes the leftover lock, and then resumes normally. Conversation
+history is flushed to the `.jsonl` store continuously, so closing the holder
+does not lose anything — but any unsent input in that terminal is discarded.
+Stale locks whose owner is already gone are ignored.
+
+Pass `--no-takeover` (or set `CCH_KIRO_TAKEOVER=0`) to leave the other process
+alone. `cch` then refuses, printing the holder's PID, tty and start time along
+with the ways out.
+
+## Blacklist
+
+Automated runs (sub-agent review prompts, one-off JSON instructions, etc.) leave
+behind sessions you rarely want to resume. `cch` can hide any session whose
+indexed content contains a blacklist keyword.
+
+Keywords come from two places, merged together:
+
+- The blacklist file, one keyword per line. Lines starting with `#` are comments
+  and blank lines are ignored. Default path is `~/.config/cch/blacklist`
+  (override with `CCH_BLACKLIST_FILE`).
+- The `CCH_BLACKLIST` environment variable, newline-separated.
+
+Matching is a case-insensitive substring test against the session's first
+message (the prompt that started it), so a keyword that merely appears later in
+the conversation body will not hide an otherwise wanted session. Example
+`~/.config/cch/blacklist`:
+
+```
+# hide sub-agent review sessions
+Review Agent
+Post-Analysis Review Agent
+```
+
+Filtering happens at display time, so editing the blacklist takes effect on the
+next run without rebuilding the cache. Pass `--no-blacklist` to show everything
+for a single run.
 
 ## Key Bindings
 
@@ -87,6 +139,9 @@ cch --cache                 # print cache directory
 - `CCH_KIRO_BIN`: Kiro CLI binary used for resume, default `kiro-cli`.
 - `CCH_CACHE_DIR`: cache directory, default `~/.cache/cch`.
 - `CCH_SOURCE`: default source filter, one of `all`, `claude`, `codex`, or `kiro`.
+- `CCH_KIRO_TAKEOVER`: set to `0` to refuse instead of closing a locked Kiro session, same as `--no-takeover`.
+- `CCH_BLACKLIST`: newline-separated keywords; any session whose first message contains one is hidden.
+- `CCH_BLACKLIST_FILE`: blacklist file path, default `~/.config/cch/blacklist`.
 
 ## Cache
 
